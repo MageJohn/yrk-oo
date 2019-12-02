@@ -1,7 +1,7 @@
-MOTOR0 = 60
-MOTOR1 = 62
-MOTOR2 = 66
-MOTOR3 = 68
+MOTOR1 = 60
+MOTOR2 = 62
+MOTOR3 = 66
+MOTOR4 = 68
 
 
 class MotorDriver:
@@ -13,7 +13,7 @@ class MotorDriver:
         self.direction = 0
 
     def set(self, speed):
-        if speed not in range(-1, 1):
+        if speed < -1 or speed > 1:
             raise ValueError(speed)
 
         self.speed = 0
