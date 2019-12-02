@@ -45,7 +45,7 @@ if __name__ == "__main__":
     from smbus2 import SMBus
     from time import sleep
     with SMBus(13) as bus:
-        drv = MotorDriver(MOTOR0, bus)
+        drv = MotorDriver(MOTOR1, bus)
         drv.set(1)
         print(f"reported values: speed={drv.speed} direction={drv.direcetion} brake={drv.brake}")
         sleep(0.5)
