@@ -55,14 +55,15 @@ class MotorDriver:
         if speed == 0:
             in2_in1 = 0b00
         elif speed < 0:
-            in2_in1 = 0b01
-        elif speed > 0:
             in2_in1 = 0b10
-    
-        # number between 0x06 and 0x3f
+        elif speed > 0:
+            in2_in1 = 0b01
+
         vset = 0x06 + int((0x3f - 0x06) * abs(speed))
         byte = (vset << 2) | in2_in1
         self._bus.write_byte_data(self._motor, 0, byte)
+
+        self._brake_state = False
 
     def brake(self) -> None:
         """Put the motor into the brake state"""
@@ -83,12 +84,40 @@ class MotorDriver:
 
         -1 is reverse, 0 is stationary, and 1 is forward
         """
-        return int(self._speed / abs(self._speed))
+        if self._speed == 0:
+            return self._speed
+        else:
+            return int(self._speed / abs(self._speed))
 
     @property
     def brake_state(self) -> bool:
         """Boolean of the state of the brake"""
         return self._brake_state
+
+    @property
+    def voltage(self):
+        """The current approximate voltage across the motor"""
+        # This calculation is taken from page 10 of the datasheet, but has been
+        # modified. The calculation in the datasheet adds one to the VSET
+        # value, but this produces values higher than those in the table on the
+        # same page. This version produces the same values as the table.
+        return (4 * 1.285 * _speed_to_vset(self.speed) / 64)
+
+
+def _speed_to_vset(speed: float) -> int:
+    """Convert a unit interval into a VSET value for the chip
+
+    The chip takes a value between 0x06 and 0x3f. Values
+    below 0x06 are reserved, and since VSET is 6 bits 0x3F is the max
+    that fits. See pages 9 to 10 of the datasheet for more info.
+
+    Args:
+        speed: A unit interval (the sign is ignored)
+    Returns:
+        An integer in the range 0x06 to 0x3f
+    """
+    return 0x06 + int((0x3f - 0x06) * abs(speed))
+
 
 if __name__ == "__main__":
     from smbus2 import SMBus
