@@ -139,7 +139,7 @@ def _speed_to_vset(speed: float) -> int:
     Returns:
         An integer in the range 0x06 to 0x3f.
     """
-    return 0x06 + int((0x3f - 0x06) * abs(speed))
+    return 0x06 + round((0x3f - 0x06) * abs(speed))
 
 
 if __name__ == "__main__":
