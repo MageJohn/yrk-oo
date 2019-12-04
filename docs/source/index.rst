@@ -8,6 +8,7 @@ This is a library for the York Robotics Lab's YRK
     :caption: Contents
    
     motors
+    pwm
 
 Indices and tables
 ==================
