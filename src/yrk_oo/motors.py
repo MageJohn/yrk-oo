@@ -65,7 +65,7 @@ class MotorDriver:
                 motor goes forward; if speed = 0, the motor coasts.
         """
         if speed < -1 or speed > 1:
-            raise ValueError(speed)
+            raise ValueError(f"Speed {speed} not in range -1 to 1")
 
         self._speed = speed
 
