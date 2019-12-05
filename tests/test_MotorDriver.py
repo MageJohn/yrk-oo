@@ -19,12 +19,16 @@ class TestMotorDriver(unittest.TestCase):
         drv = MotorDriver(0, bus)
         drv.set(1)
         bus.write_byte_data.assert_called_with(0, 0, 0b11111101)
+        drv.set(0.5)
+        bus.write_byte_data.assert_called_with(0, 0, 0b10001001)
 
     def test_set_backward(self):
         bus = Mock()
         drv = MotorDriver(0, bus)
         drv.set(-1)
         bus.write_byte_data.assert_called_with(0, 0, 0b11111110)
+        drv.set(-0.5)
+        bus.write_byte_data.assert_called_with(0, 0, 0b10001010)
 
     def test_brake(self):
         bus = Mock()
