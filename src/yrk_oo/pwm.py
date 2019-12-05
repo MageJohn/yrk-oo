@@ -226,7 +226,7 @@ class PWMOutput:
 
         self._delay = int(delay * 4095)
 
-        self._bus.write_block_data(
+        self._bus.write_i2c_block_data(
             self._addr,
             self._first_reg,
             data=[(self._delay & 0xFF), ((self._delay & 0xF00) >> 8)],
@@ -259,7 +259,7 @@ class PWMOutput:
 
         self.off_at_count = (self._delay + on_time) % 4096
 
-        self._bus.write_block_data(
+        self._bus.write_i2c_block_data(
             self._addr,
             self._first_reg + 2,
             data=[
