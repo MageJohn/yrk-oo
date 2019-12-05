@@ -12,27 +12,20 @@ https://www.nxp.com/docs/en/data-sheet/PCA9685.pdf.
 from smbus2 import SMBus
 from typing import Union, Tuple
 from time import sleep
-from enum import Enum
-from yrk_oo.utils import Pointer
+from enum import IntEnum
 
 YRL040_PWM = 0x40
+"""I2C address of the PCA9685 on the YRL040"""
 
 
-class PointerEnum(Pointer, Enum):
-    """Pointer enumerator. Members will have values of type Pointer."""
-    def __new__(cls, value):
-        obj = Pointer.__new__(cls, value)
-        obj._value_ = Pointer(value)
-        return obj
-
-
-class Registers(PointerEnum):
+class Registers(IntEnum):
     """Enumerator which maps register names to addresses."""
+
     MODE1 = 0x00
     PRE_SCALE = 0xFE
 
 
-Channels = PointerEnum(
+Channels = IntEnum(
     "Channels",
     list(zip([f"CHAN{n}" for n in range(16)], range(0x06, 0x45 + 1, 4)))
     + [("CHAN_ALL", 0xFA)],
@@ -42,7 +35,7 @@ Channels = PointerEnum(
 Each channel is controlled by two 13-bit registers, or as the I2C interface
 sees it, four 8-bit registers; the register addresses are sequential. This
 enumerator points to the first address of each channel, subsequent addresses
-can be found by adding
+can be found by addition.
 """
 
 
@@ -76,12 +69,10 @@ class PWMController:
         self._addr = addr
         self._bus = bus
 
-        self._sleeping = True
-
         self.channels = tuple(
             [
-                PWMOutput(addr, bus, reg, self._calc_delay(reg), self)
-                for reg in range(Channels.CHAN0, Channels.CHAN15 + 1, 4)
+                PWMOutput(addr, bus, channel, self._calc_delay(channel), self)
+                for channel in list(Channels)[:-1]
             ]
         )
 
@@ -207,7 +198,7 @@ class PWMOutput:
         self,
         addr: int,
         bus: "SMBus",
-        register: "Channels",
+        channel: "Channels",
         delay: float,
         parent: "PWMController",
     ):
@@ -216,8 +207,7 @@ class PWMOutput:
         Arguments:
             addr: I2C address of the chip.
             bus: Open I2C bus.
-            register: The first of the 4 sequential registers used to control
-                the output.
+            channel: The channel on the chip to control
             delay: Unit interval proportion of the cycle to delay the rising edge.
             parent: The parent chip the output belongs to.
 
@@ -226,14 +216,20 @@ class PWMOutput:
         """
         self._addr = addr
         self._bus = bus
-        self._registers = register
+        self._first_reg = channel
         self._off = True
-        self._led_on = 0
-        self._led_off = 0
+        self._off_at_count = 0
 
         if delay < 0 or delay > 1:
             raise ValueError(f"{delay} is not in range [0, 1].")
-        self._delay = delay
+
+        self._delay = int(delay * 4095)
+
+        self._bus.write_block_data(
+            self._addr,
+            self._first_reg,
+            data=[(self._delay & 0xFF), ((self._delay & 0xF00) >> 8)],
+        )
 
     def change_duty_cycle(self, duty_cycle: float):
         """Change the duty cycle of the output.
@@ -241,33 +237,33 @@ class PWMOutput:
         Set the on time of the PWM signal.
 
         Arguments:
-            duty_cycle: ``0 < duty_cycle <= 1``. Represents the proportion of the
-                wave which is high. The proportion which is low is ``1 - duty_cycle``.
+            duty_cycle: `0 < duty_cycle <= 1`. Represents the proportion of the
+                wave which is high. The proportion which is low is `1 - duty_cycle`.
                 A duty cycle of 0 is not allowed; instead disable the output with
-                :meth:`set_enable`.
+                :meth:`set_enable`. A duty cycle of 1 sets the output to constant high.
         Raises:
-            ValueError: If *duty_cycle* is not a unit interval.
+            ValueError: If `duty_cycle` is not a unit interval.
             RuntimeError: If the chip is in sleep mode.
         """
-        if duty_cycle <= 0 or duty_cycle > 1:
-            raise ValueError(f"{duty_cycle} is not in range (0, 1].")
+        on_time = int(duty_cycle * 4095)
+        if on_time <= 0 or on_time > 4095:
+            raise ValueError(
+                f"{duty_cycle} is not in range (0, 1], adjusted for resolution."
+            )
         elif self._parent.sleeping:
             raise RuntimeError("Tried to change PWM values while sleeping.")
         elif duty_cycle == 1:
             self.set_full_on(True)
             return
 
-        self._led_on = int(self._delay * 4095)
-        self._led_off = (self._led_on + int(duty_cycle * 4095)) % 4095
+        self.off_at_count = (self._delay + on_time) % 4096
 
         self._bus.write_block_data(
             self._addr,
-            self._registers,
+            self._first_reg + 2,
             data=[
-                (self._led_on & 0xFF),
-                ((self._led_on & 0xF00) >> 8),
-                (self._led_off & 0xFF),
-                (((self._led_off & 0xF00) >> 8) | int(self._off) << 4),
+                (self.off_at_count & 0xFF),
+                (((self.off_at_count & 0xF00) >> 8) | int(self._off) << 4),
             ],
         )
 
@@ -282,12 +278,15 @@ class PWMOutput:
         """
         if self._parent.sleeping:
             raise RuntimeError("Tried to enable a PWM while sleeping.")
-        led_off_h = self._registers[3]
-        current_val = (self._led_off & 0xF00) >> 8
-        self._bus.write_byte_data(
-            self._addr, led_off_h, current_val | (int(enable) << 4)
-        )
+        led_off_h = self._first_reg + 3
+        value = ((self._off_at_count & 0xF00) >> 8) | (int(enable) << 4)
+        self._bus.write_byte_data(self._addr, led_off_h, value)
         self._off = enable
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the channel is enabled. Read only."""
+        return not self._off
 
     def _set_full_on(self, enable: bool):
         """When set the output is always high.
@@ -297,8 +296,6 @@ class PWMOutput:
         Arguments:
             enable: Value of the full ON bit
         """
-        led_on_h = self._registers[1]
-        current_val = (self._led_on & 0xF00) >> 8
-        self._bus.write_byte_data(
-            self._addr, led_on_h, current_val | (int(enable) << 4)
-        )
+        led_on_h = self._first_reg + 1
+        value = ((self._delay & 0xF00) >> 8) | (int(enable) << 4)
+        self._bus.write_byte_data(self._addr, led_on_h, value)
