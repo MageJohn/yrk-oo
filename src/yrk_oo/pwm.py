@@ -217,6 +217,7 @@ class PWMOutput:
         self._addr = addr
         self._bus = bus
         self._first_reg = channel
+        self._parent = parent
         self._off = True
         self._off_at_count = 0
 
