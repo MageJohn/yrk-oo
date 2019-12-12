@@ -9,12 +9,19 @@ The datasheet can be found in docs/datasheets/PCA9685.pdf, or online at
 https://www.nxp.com/docs/en/data-sheet/PCA9685.pdf.
 """
 
-from smbus2 import SMBus
-from typing import Union, Tuple
+from smbus2 import SMBus, i2c_msg
+from typing import Tuple, Dict, Optional
 from time import sleep
 from enum import IntEnum
+import struct
 
-YRL040_PWM = 0x40
+PWM_RESOLUTION = 4096
+PWM_MAX_COUNT = PWM_RESOLUTION - 1
+PWM_CLOCK_HZ = 25e6
+
+PWM_I2C_BUS = 11
+"""I2C bus the PWM is on"""
+PWM_I2C_ADDR = 0x40
 """I2C address of the PCA9685 on the YRL040"""
 
 
@@ -25,72 +32,69 @@ class Registers(IntEnum):
     PRE_SCALE = 0xFE
 
 
-Channels = IntEnum(
-    "Channels",
-    list(zip([f"CHAN{n}" for n in range(16)], range(0x06, 0x45 + 1, 4)))
-    + [("CHAN_ALL", 0xFA)],
-)
-"""Enumerator which maps channel names to the address of their first register.
+class Channels(IntEnum):
+    """Enumerator which maps channel names to the address of their first register.
 
-Each channel is controlled by two 13-bit registers, or as the I2C interface
-sees it, four 8-bit registers; the register addresses are sequential. This
-enumerator points to the first address of each channel, subsequent addresses
-can be found by addition.
-"""
+    Each channel is controlled by two 13-bit registers, or as the I2C interface
+    sees it, four 8-bit registers; the register addresses are sequential. This
+    enumerator points to the first address of each channel, subsequent addresses
+    can be found by addition.
+    """
+
+    CHAN0 = 0x06
+    CHAN1 = 0x0A
+    CHAN2 = 0x0E
+    CHAN3 = 0x12
+    CHAN4 = 0x16
+    CHAN5 = 0x1A
+    CHAN6 = 0x1E
+    CHAN7 = 0x22
+    CHAN8 = 0x26
+    CHAN9 = 0x2A
+    CHAN10 = 0x2E
+    CHAN11 = 0x32
+    CHAN12 = 0x36
+    CHAN13 = 0x3A
+    CHAN14 = 0x3E
+    CHAN15 = 0x42
+    CHAN_ALL = 0xFA
 
 
 class PWMController:
-    """Master controller for the PWM chip
+    """Controls the state of the chip as a whole, including frequency and sleep
+    mode.
 
-    This class controls the entire PWM chip. It's used to control the state of
-    the chip as a whole, including frequency and sleep mode.
+    When created it disables the sleep state and enables autoincrementing the
+    address.
 
+    Arguments:
+        bus: The open I2C bus the chip is attached to
+        addr: The I2C address of the chip to use
+        freq: The frequency of all the PWM outputs (not the duty cycle).
+            Default: approx 200Hz
     Attributes:
-        channels: A tuple of PWMOutput objects representing the 16 different channels
+        channels: Maps members of Channels to PWMOutputs representing each channel.
     """
 
-    channels: Tuple["PWMOutput", ...] = tuple()
-
-    def __init__(self, addr: int, bus: SMBus, freq: Union[int, float, None] = None):
-        """Initiliase the chip controller.
-
-        If a frequency is passed it is set. If it is not passed, the default is
-        approximately 200Hz.
-
-        The chip begins in a sleep state, so disable SLEEP. Also enable
-        autoincrementing the address so that all of the registers of a channel
-        can be written to with only one start and stop.
-
-        Arguments:
-            addr: The I2C address of the chip to use
-            bus: The open I2C bus the chip is attached to
-            freq: The frequency of all the PWM outputs (not the duty cycle)
-        """
+    def __init__(self, bus: SMBus, addr: int, freq: Optional[float] = None):
         self._addr = addr
         self._bus = bus
 
-        self.channels = tuple(
-            [
-                PWMOutput(addr, bus, channel, self._calc_delay(channel), self)
-                for channel in list(Channels)[:-1]
-            ]
-        )
+        self.channels: Dict["Channels", "PWMOutput"] = {
+            channel: PWMOutput(bus, addr, channel, self._calc_delay(channel), self)
+            for channel in Channels
+        }
 
-        # Writing to this channel writes to all the channels at once
-        self._global_channel = PWMOutput(addr, bus, Channels.CHAN_ALL, 0, self)
-
+        self._prescale = 0x1E
         if freq is not None:
             self._set_prescale(freq)
-        else:
-            self._prescale = 0x1E
 
         # Set AI (MODE1 bit 5); enables register autoincrement
         # This also resets SLEEP (MODE1 bit 4) and disables low power mode
-        self._bus.write_byte_data(self._addr, Registers.MODE1, (1 << 5))
+        self._mode1 = 1 << 5
+        self._bus.write_byte_data(self._addr, Registers.MODE1, self._mode1)
 
-        self._sleeping = False
-
-    def sleep(self):
+    def sleep(self) -> None:
         """Put the PWM controller into sleep mode.
 
         In this mode the oscillator is off. All outputs are switched off and
@@ -100,61 +104,79 @@ class PWMController:
         up again once the controller is woken up. If not then when the system
         is started again with :meth:`wakeup` all PWMs will continue.
         """
-        value = self._bus.read_byte_data(self._addr, Registers.MODE1)
-        value |= 1 << 4
-        self._bus.write_byte_data(self._addr, Registers.MODE1, value)
-        self._sleeping = True
+        self._mode1 |= 1 << 4
+        self._bus.write_byte_data(self._addr, Registers.MODE1, self._mode1)
 
-    def wakeup(self):
+    def wakeup(self) -> None:
         """Wakeup the controller after being put into sleep mode.
 
-        If the controller was not in sleep mode, do nothing. Otherwise disable
-        sleep mode and attempt to restart running PWMs if possible.
+        If the controller was not in sleep mode, this does nothing. Otherwise
+        it disable sleep mode and attempts to restart any running PWMs if
+        possible.
         """
         if self.sleeping:
             value = self._bus.read_byte_data(self._addr, Registers.MODE1)
             restart = bool(value & (1 << 7))
             value &= ~(1 << 4) & ~(1 << 7)
+            self._mode1 = value
             self._bus.write_byte_data(self._addr, Registers.MODE1, value)
             if restart:
                 sleep(500e-6)
                 value |= 1 << 7
                 self._bus.write_byte_data(self._addr, Registers.MODE1, value)
-            self._sleeping = False
 
     @property
     def sleeping(self) -> bool:
         """True if the controller was put into sleep mode."""
-        return self._sleeping
+        return bool(self._mode1 & (1 << 4))
 
     @property
     def frequency(self) -> float:
         """The frequency of the PWM signals.
 
-        Calculated based on the prescale value set on the chip.
+        Calculated based on the prescale value set on the chip, and may be
+        slightly different from the one set by :meth:`set_frequency`.
         """
-        return 1 / ((self._prescale + 1) * 4096 / 25e6)
+        # prescale + 1 = clocks per increment
+        # clocks per increment * increments per PWM cycle = clocks per PWM cycle
+        # clocks per PWM cycle * seconds per clock (aka 1 / clock freqency) =
+        #       seconds per PWM cycle
+        # 1 / seconds per PWM cycle = PWM cycles per second, aka the frequency
+        return 1 / ((self._prescale + 1) * PWM_RESOLUTION / PWM_CLOCK_HZ)
+
+    @property
+    def min_pulse_width(self) -> float:
+        """Current minimum pulse width in microseconds
+        """
+        return width_limits_from_freq(self.frequency)[0]
+
+    @property
+    def max_pulse_width(self) -> float:
+        """Current maximum pulse width in microseconds
+        """
+        return width_limits_from_freq(self.frequency)[1]
 
     @property
     def global_channel(self) -> "PWMOutput":
         """Writing to this channel writes the same pattern to all the
-        channels.
-        """
-        return self._global_channel
+        channels. Reads from it always return 0/False.
 
-    def set_frequency(self, freq: Union[int, float]):
+        This is the same as `channels[Channels.CHAN_ALL]`.
+        """
+        return self.channels[Channels.CHAN_ALL]
+
+    def set_frequency(self, freq: float) -> None:
         """Set the frequency of the PWM controller.
 
         If the chip is not asleep, this method puts the chip to sleep, sets the
         frequency, then wakes it up again.
 
-        The frequency range is approximately 24Hz to 1526Hz, and frequencies
-        which fall outside of the limits of the device will be clamped.
+        The frequency range is approximately 23.84Hz to 1525.88Hz.
 
         Arguments:
             freq: The new frequency.
         Raises:
-            ValueError: If freq <= 0
+            ValueError: If freq outside of approx range 23.84 < freq < 1525.88.
         """
         if self.sleeping:
             self._set_prescale(freq)
@@ -163,17 +185,36 @@ class PWMController:
             self._set_prescale(freq)
             self.wakeup()
 
-    def _set_prescale(self, freq: Union[int, float]):
+    def sync(self) -> None:
+        """Debugging method. Syncs the values in registers on the chip with the
+        values stored inside the PWMController object and it's child PWMOutput
+        objects.
+        """
+        self._mode1 = self._bus.read_byte_data(self._addr, Registers.MODE1)
+        self._prescale = self._bus.read_byte_data(self._addr, Registers.PRE_SCALE)
+        for channel in self.channels.values():
+            channel._read_state()
+
+    def _set_prescale(self, freq: float) -> None:
         """Private function to set the prescale value from a frequency
 
         Arguments:
             freq: The target frequency.
         """
-        if freq <= 0:
-            raise ValueError(freq)
-        prescale_value = round(25e6 / (4096 * freq)) - 1
-        prescale_value = max(prescale_value, 0x03)
-        prescale_value = min(prescale_value, 0xFF)
+        # To produce the PWM signal a counter is incremented every
+        # prescale_value + 1 clock cycles (the plus one is because the clock
+        # cycles are counted from 0).
+        # The calculation is:
+        #     increments per second =
+        #          increments per PWM cycle * desired PWM cycles per second
+        #     seconds per increment = 1 / increments per second
+        #     clocks per increment = clocks per second * seconds per increment
+        #     prescale value = round(clocks per increment) - 1
+        prescale_value = round(PWM_CLOCK_HZ / (PWM_RESOLUTION * freq)) - 1
+
+        # 0x03 is minumum enforced by hardware; 0xFF is maximum 8-bit value.
+        if prescale_value < 0x03 or prescale_value > 0xFF:
+            raise ValueError(f"Frequency {freq} not supported by device.")
         self._prescale = prescale_value
 
         self._bus.write_byte_data(self._addr, Registers.PRE_SCALE, prescale_value)
@@ -185,57 +226,59 @@ class PWMController:
         different time. This function calculates a delay based on the register
         address of the channel.
 
+        The delay on channel 0 will be 0, channel 1 1/16, channel 2 2/16, etc.
+
         Arguments:
             register: The register to calculate with.
         """
-        return (register - 0x6) / (4 * 16 - 1)
+        if register is Channels.CHAN_ALL:
+            return 0
+        else:
+            return (register - Channels.CHAN0) / (4 * 16 - 1)
 
 
 class PWMOutput:
-    """Used to control a single output on the chip."""
+    """Used to control a single output on the chip.
+
+    Usually you will not instantiate this class directly. Instead use the
+    members of :attr:`PWMController.channels`.
+
+    Arguments:
+        addr: I2C address of the chip.
+        bus: An open I2C bus.
+        channel: The channel on the chip to control
+        delay: Unit interval proportion of the cycle to delay the rising edge.
+        parent: The parent chip the output belongs to.
+
+    Raises:
+        ValueError: If delay is not a unit interval.
+    """
 
     def __init__(
         self,
-        addr: int,
         bus: "SMBus",
+        addr: int,
         channel: "Channels",
         delay: float,
         parent: "PWMController",
     ):
-        """Initialise the class
-
-        Arguments:
-            addr: I2C address of the chip.
-            bus: Open I2C bus.
-            channel: The channel on the chip to control
-            delay: Unit interval proportion of the cycle to delay the rising edge.
-            parent: The parent chip the output belongs to.
-
-        Raises:
-            ValueError: If delay is not a unit interval.
-        """
         self._addr = addr
         self._bus = bus
         self._first_reg = channel
         self._parent = parent
-        self._off = True
-        self._off_at_count = 0
 
         if delay < 0 or delay > 1:
             raise ValueError(f"{delay} is not in range [0, 1].")
 
-        self._delay = int(delay * 4095)
+        self._on_count = int(delay * PWM_MAX_COUNT)
+        self._full_on = False
+        self._off_count = 0
+        self._full_off = True
 
-        self._bus.write_i2c_block_data(
-            self._addr,
-            self._first_reg,
-            data=[(self._delay & 0xFF), ((self._delay & 0xF00) >> 8)],
-        )
+        self._write_state()
 
-    def change_duty_cycle(self, duty_cycle: float):
+    def change_duty_cycle(self, duty_cycle: float) -> None:
         """Change the duty cycle of the output.
-
-        Set the on time of the PWM signal.
 
         Arguments:
             duty_cycle: `0 < duty_cycle <= 1`. Represents the proportion of the
@@ -246,57 +289,139 @@ class PWMOutput:
             ValueError: If `duty_cycle` is not a unit interval.
             RuntimeError: If the chip is in sleep mode.
         """
-        on_time = int(duty_cycle * 4095)
-        if on_time <= 0 or on_time > 4095:
+        on_time = int(duty_cycle * PWM_RESOLUTION)
+        if on_time == PWM_RESOLUTION:  # 100% on
+            self._full_on = True
+            self._write_state()
+        elif on_time <= 0 or on_time > PWM_MAX_COUNT:
+            # A duty cycle of approximately 0.00024 or less is technically in
+            # the range (0, 1], but when multiplied by 4096 and converted to an
+            # int results in 0.
             raise ValueError(
-                f"{duty_cycle} is not in range (0, 1], adjusted for resolution."
+                f"{duty_cycle} is not in range (0, 1] (adjusted for resolution)."
             )
         elif self._parent.sleeping:
             raise RuntimeError("Tried to change PWM values while sleeping.")
-        elif duty_cycle == 1:
-            self.set_full_on(True)
-            return
+        else:
+            self._full_on = False
+            self._off_count = (self._on_count + on_time) % PWM_RESOLUTION
+            self._write_state()
 
-        self.off_at_count = (self._delay + on_time) % 4096
+    def change_pulse_width(self, us_pulse_width: float) -> None:
+        """Change the pulse width in microseconds.
 
-        self._bus.write_i2c_block_data(
-            self._addr,
-            self._first_reg + 2,
-            data=[
-                (self.off_at_count & 0xFF),
-                (((self.off_at_count & 0xF00) >> 8) | int(self._off) << 4),
-            ],
-        )
+        The limiting values for the pulse width are decided by the frequency.
+        The properties :attr:`PWMController.max_pulse_width` and
+        :attr:`PWMController.min_pulse_width` provide the current limits.
 
-    def set_enable(self, enable: bool):
+        Arguments:
+            us_pulse_width: The pulse width to set in microseconds.
+        Raises:
+            ValueError: if `us_pulse_width` is outside the current limits.
+        """
+        limits = width_limits_from_freq(self._parent.frequency)
+        if us_pulse_width < limits[0] or us_pulse_width > limits[1]:
+            raise ValueError(
+                f"{us_pulse_width} can't be acheived with {self._parent.frequency}Hz."
+            )
+        us_per_increment = limits[0]
+        increments = round(us_pulse_width / us_per_increment)
+        self._off_count = (self._on_count + increments) % PWM_RESOLUTION
+        self._full_on = False
+        self._write_state()
+
+    def set_enable(self, enable: bool) -> None:
         """Enable or disable the output.
 
         Arguments:
-            enable: New state of the output.
+            enable: True to enable the output, False to disable.
 
         Raises:
             RuntimeError: If the chip is in sleep mode.
         """
         if self._parent.sleeping:
-            raise RuntimeError("Tried to enable a PWM while sleeping.")
-        led_off_h = self._first_reg + 3
-        value = ((self._off_at_count & 0xF00) >> 8) | (int(enable) << 4)
-        self._bus.write_byte_data(self._addr, led_off_h, value)
-        self._off = enable
+            raise RuntimeError("Tried to modify a PWM while sleeping.")
+
+        self._full_off = not enable
+        self._write_state()
+
+    @property
+    def duty_cycle(self) -> float:
+        """The current duty cycle of the output.
+
+        Given as a unit interval, a float in the range [0, 1]. Calculated from
+        the values set on the chip, not the value set by
+        :meth:`set_duty_cycle`. If the channel is not enabled or is the global
+        channel the value is zero.
+        """
+        if self._full_off or self._first_reg == Channels.CHAN_ALL:
+            return 0.0
+        elif self._full_on:
+            return 1.0
+        else:
+            on_time = (self._off_count - self._on_count) % PWM_RESOLUTION
+            return on_time / PWM_RESOLUTION
+
+    @property
+    def pulse_width(self) -> float:
+        """The current pulse width in microseconds.
+
+        If the output is 100% on this will equal the period of the signal.
+        Calculated from the value set on the chip, not the value set by
+        :meth:`change_pulse_width`. If the channel is not enabled or is the
+        global channel the value is zero.
+        """
+        if self._full_off or self._first_reg == Channels.CHAN_ALL:
+            return 0.0
+        elif self._full_on:
+            return 1e6 / self._parent.frequency
+        else:
+            us_per_increment = width_limits_from_freq(self._parent.frequency)[0]
+            increments = (self._off_count - self._on_count) % PWM_RESOLUTION
+            return increments * us_per_increment
 
     @property
     def enabled(self) -> bool:
-        """Whether the channel is enabled. Read only."""
-        return not self._off
+        """Whether the channel is enabled. Read only.
 
-    def _set_full_on(self, enable: bool):
-        """When set the output is always high.
+        If the object is controlling the global channel, always returns False."""
+        if self._first_reg == Channels.CHAN_ALL:
+            return False
+        else:
+            return not self._full_off
 
-        Used to set the duty cycle to 100%.
-
-        Arguments:
-            enable: Value of the full ON bit
+    def _read_state(self) -> None:
+        """Debugging method. Sets the internal state based on the 4 registers
+        in data.
         """
-        led_on_h = self._first_reg + 1
-        value = ((self._delay & 0xF00) >> 8) | (int(enable) << 4)
-        self._bus.write_byte_data(self._addr, led_on_h, value)
+        msg = i2c_msg.read(self._addr, 4)
+        self._bus.i2c_rdwr(msg)
+        data = struct.unpack("<h<h", msg.buf)
+        self._on_count = data[0] & 0xFFF
+        self._full_on = bool(data[0] & 0x1000)
+        self._off_count = data[1] & 0xFFF
+        self._full_off = bool(data[1] & 0x1000)
+
+    def _write_state(self) -> None:
+        """Take the local object state and write it to the channel."""
+        buf = struct.pack(
+            "<Bhh",
+            self._first_reg,
+            (self._on_count | (int(self._full_on) << 12)),
+            (self._off_count | (int(self._full_off) << 12)),
+        )
+        msg = i2c_msg.write(self._addr, buf)
+        self._bus.i2c_rdwr(msg)
+
+
+def width_limits_from_freq(freq: float) -> Tuple[float, float]:
+    """Calculate min and max pulse widths possible with a particular frequency.
+
+    Arguments:
+        freq: Frequency to calculate for.
+    Returns:
+        Minumum and maximum pulse widths in microseconds.
+    """
+    period = (1 / freq) * 1e6  # In microseconds
+    increment_period = period / PWM_RESOLUTION
+    return increment_period, increment_period * PWM_MAX_COUNT
