@@ -49,19 +49,19 @@ class MotorDriver:
     negative unit interval, where negative values cause the motor to reverse,
     positive values cause it to go forward, and 0 sets the driver to
     coast/standby mode. A seperate method applies the brakes.
+
+    Args:
+        motor_addr: I2C address of the motor controller.
+        bus: An open SMBus object.
     """
 
-    def __init__(self, motor: Motors, bus: SMBus):
-        """Init the class with a specific I2C address and bus.
-
-        Args:
-            motor_addr: I2C address of the motor controller.
-            bus: An open SMBus object.
-        """
+    def __init__(self, motor: Motors, bus: SMBus, min_speed: int):
         self._bus = bus
         self._motor = motor
         self._speed = 0.0
+        self._direction = 0
         self._brake_state = False
+        self._min_speed = min_speed
 
     def set(self, speed: float) -> None:
         """Set the speed of the motor.
@@ -78,17 +78,20 @@ class MotorDriver:
         if speed < -1 or speed > 1:
             raise ValueError(f"Speed {speed} not in range -1 to 1")
 
+        self._direction = (speed > 0) - (speed < 0)
+
+        speed = abs(speed) if abs(speed) > self._min_speed else self._min_speed
         self._speed = speed
 
         # Bits IN1 and IN2 of the control register select the device mode. When
         # both are 0, the device is in low power standby/coast mode, when one
         # is set but not both the device goes forward or backward, and when
         # both are set the device brakes
-        if speed == 0:
+        if self._direction == 0:
             in2_in1 = 0b00
-        elif speed < 0:
+        elif self._direction < 0:
             in2_in1 = 0b10
-        elif speed > 0:
+        elif self._direction > 0:
             in2_in1 = 0b01
 
         vset = 0x06 + int((0x3F - 0x06) * abs(speed))
@@ -109,7 +112,7 @@ class MotorDriver:
 
     @property
     def speed(self) -> float:
-        """Current speed the motor is set to. -1 <= speed <= 1.
+        """Current speed the motor is set to. 0 <= speed <= 1.
         """
         return self._speed
 
@@ -119,10 +122,7 @@ class MotorDriver:
 
             -1 for reverse, 0 for stationary, and 1 for forward.
         """
-        if self._speed == 0:
-            return int(self._speed)
-        else:
-            return int(self._speed / abs(self._speed))
+        return self._direction
 
     @property
     def brake_state(self) -> bool:
